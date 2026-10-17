@@ -39,7 +39,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
   if (!res.ok) {
     throw new ApiError(
-      body?.error || `Request failed with status ${res.status}`,
+      (typeof body?.error === "string" && body.error.trim()) || `Request failed with status ${res.status}`,
       res.status,
       Array.isArray(body?.details) ? body.details : []
     )
