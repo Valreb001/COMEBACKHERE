@@ -60,7 +60,12 @@ export async function createInvoice(
   const contract = new Contract(contractId)
 
   const now = Math.floor(Date.now() / 1000)
-  const expiresInSeconds = BigInt(body.due_date - now)
+  // A due date at or before "now" would produce a negative/zero expiry, which
+  // BigInt/u64 encoding cannot represent and would surface as an unexpected exception.
+  if (!Number.isFinite(body.due_date) || body.due_date <= now) {
+    throw Object.assign(new Error("due_date must be in the future"), { status: 400 })
+  }
+  const expiresInSeconds = BigInt(Math.trunc(body.due_date - now))
 
   const args = [
     nativeToScVal(body.merchant_address, { type: "address" }),
@@ -354,7 +359,7 @@ router.get("/export.csv", async (req: Request, res: Response) => {
     } else {
       // Mid-stream failure: abort so the client sees a truncated download
       // rather than a file that silently looks complete.
-      res.locals.logger.error(
+      res.locals.logger?.error(
         { errorName: err instanceof Error ? err.name : "UnknownError" },
         "Invoice CSV export failed mid-stream",
       )
@@ -450,7 +455,8 @@ router.get("/", validateQuery(invoiceListQuerySchema), asyncHandler(async (req: 
   const pageKey = legacyPagination ? `legacy-${page}-${offset}` : `cursor-${query.cursor ?? "first"}`
   const cacheKey = `invoices:${pageKey}:${limit}:${status ?? "all"}:${merchant ?? "all"}`
 
-  const cached = await cacheGet<Record<string, unknown>>(cacheKey)
+  // A cache outage must degrade to a database read, not fail the request.
+  const cached = await cacheGet<Record<string, unknown>>(cacheKey).catch(() => null)
   if (cached) {
     res.json(cached)
     return
@@ -487,7 +493,7 @@ router.get("/", validateQuery(invoiceListQuerySchema), asyncHandler(async (req: 
     Object.assign(result, { total, page, totalPages: Math.ceil(total / limit), offset })
   }
 
-  await cacheSet(cacheKey, result, 30)
+  await Promise.resolve(cacheSet(cacheKey, result, 30)).catch(() => {})
   res.json(result)
 }))
 
@@ -785,17 +791,29 @@ router.post("/", requireMerchantApiKey, validateBody(createInvoiceSchema), async
   }
 
   const now = new Date()
-  await collection.insertOne({
-    invoice_id: result.invoice_id,
-    merchant_address: body.merchant_address,
-    token: body.token,
-    amount: body.amount,
-    due_date: body.due_date,
-    reference: body.reference,
-    status: "Pending",
-    created_at: now,
-    updated_at: now,
-  })
+  try {
+    await collection.insertOne({
+      invoice_id: result.invoice_id,
+      merchant_address: body.merchant_address,
+      token: body.token,
+      amount: body.amount,
+      due_date: body.due_date,
+      reference: body.reference,
+      status: "Pending",
+      created_at: now,
+      updated_at: now,
+    })
+  } catch (err: unknown) {
+    // Concurrent requests can pass the findOne check above; the unique index
+    // then rejects the loser with E11000, which must be a 409 and not a 500.
+    if (err && typeof err === "object" && (err as { code?: number }).code === 11000) {
+      throw Object.assign(
+        new Error(`Invoice ID ${result.invoice_id} already exists; please retry to generate a new ID`),
+        { status: 409 },
+      )
+    }
+    throw err
+  }
 
   res.status(201).json(result)
 }))
