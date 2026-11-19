@@ -56,6 +56,13 @@ export async function createInvoice(
     )
   }
 
+  if (!Number.isSafeInteger(body.amount) || body.amount <= 0) {
+    throw Object.assign(new Error("amount must be a positive integer in the token's smallest unit"), { status: 400 })
+  }
+  if (typeof body.token !== "string" || !body.token.trim()) {
+    throw Object.assign(new Error("token is required"), { status: 400 })
+  }
+
   const keypair = Keypair.fromSecret(signerSecret)
   const contract = new Contract(contractId)
 
@@ -135,6 +142,22 @@ export async function createInvoice(
 // ---------------------------------------------------------------------------
 
 const ALLOWED_STATUSES: InvoiceStatus[] = ["Pending", "Paid", "Expired", "Cancelled", "RefundRequested", "Released"]
+
+const MAX_U64 = 18_446_744_073_709_551_615n
+
+/** Normalizes a path invoice ID (strips leading zeros) and rejects values outside u64. */
+export function normalizeInvoiceId(raw: string): string {
+  let value: bigint
+  try {
+    value = BigInt(raw)
+  } catch {
+    throw Object.assign(new Error("id must be a positive integer"), { status: 400 })
+  }
+  if (value < 0n || value > MAX_U64) {
+    throw Object.assign(new Error("id must fit in an unsigned 64-bit integer"), { status: 400 })
+  }
+  return value.toString()
+}
 
 export interface ListFilters {
   status?: InvoiceStatus
@@ -576,7 +599,7 @@ async function syncInvoiceStatus(
 router.get("/:id", validateParams(invoiceIdParamSchema), asyncHandler(async (req: Request, res: Response) => {
   // Normalize the invoice ID to strip leading zeros so that "042" and "42"
   // resolve to the same invoice (issue #880: mixed-case / zero-padded IDs).
-  const id = String(BigInt(req.params.id))
+  const id = normalizeInvoiceId(req.params.id)
 
   const env = requireEnv({ invoiceContractId: "INVOICE_CONTRACT_ID", rpcUrl: "SOROBAN_RPC_URL", signerSecret: "SIGNER_SECRET_KEY", networkPassphrase: "NETWORK_PASSPHRASE" })
 
@@ -645,7 +668,7 @@ router.get("/:id", validateParams(invoiceIdParamSchema), asyncHandler(async (req
 router.get("/:id/events", validateParams(invoiceIdParamSchema), asyncHandler(async (req: Request, res: Response) => {
   // Normalize the invoice ID to strip leading zeros so that "042" and "42"
   // resolve to the same invoice (issue #880: mixed-case / zero-padded IDs).
-  const id = String(BigInt(req.params.id))
+  const id = normalizeInvoiceId(req.params.id)
   const db = await connectMongo()
   const invoice = await getInvoicesCollection(db).findOne({ invoice_id: id })
 
