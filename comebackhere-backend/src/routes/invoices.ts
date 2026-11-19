@@ -347,7 +347,7 @@ router.get("/export.csv", async (req: Request, res: Response) => {
   let cursor: FindCursor<WithId<InvoiceRecord>> | undefined
   try {
     const db = await connectMongo()
-    cursor = getInvoicesCollection(db).find(buildListFilter(filters)).sort({ created_at: -1 })
+    cursor = getInvoicesCollection(db).find(buildListFilter(filters)).sort({ created_at: -1 }).batchSize(500)
 
     // Rows are written as they arrive from the Mongo cursor, so memory use
     // stays flat regardless of how many invoices are exported. Headers are
@@ -583,9 +583,9 @@ async function syncInvoiceStatus(
       networkPassphrase: env.networkPassphrase,
     })
 
-    // Update the database with the current contract status
+    // Only write when the status actually changed, to avoid a write per read.
     await collection.updateOne(
-      { invoice_id: invoiceId },
+      { invoice_id: invoiceId, status: { $ne: contractStatus } },
       { $set: { status: contractStatus, updated_at: new Date() } }
     )
 
@@ -607,7 +607,7 @@ router.get("/:id", validateParams(invoiceIdParamSchema), asyncHandler(async (req
   const collection = getInvoicesCollection(db)
 
   // Get the invoice from database
-  const invoice = await collection.findOne({ invoice_id: id })
+  const invoice = await collection.findOne({ invoice_id: id }, { projection: { _id: 0, status: 1, due_date: 1 } })
   if (!invoice) {
     throw new NotFoundError("Invoice not found")
   }
@@ -665,12 +665,14 @@ router.get("/:id", validateParams(invoiceIdParamSchema), asyncHandler(async (req
  *       404:
  *         description: Invoice not found
  */
+const MAX_EVENTS_PER_INVOICE = 1000
+
 router.get("/:id/events", validateParams(invoiceIdParamSchema), asyncHandler(async (req: Request, res: Response) => {
   // Normalize the invoice ID to strip leading zeros so that "042" and "42"
   // resolve to the same invoice (issue #880: mixed-case / zero-padded IDs).
   const id = normalizeInvoiceId(req.params.id)
   const db = await connectMongo()
-  const invoice = await getInvoicesCollection(db).findOne({ invoice_id: id })
+  const invoice = await getInvoicesCollection(db).findOne({ invoice_id: id }, { projection: { _id: 1 } })
 
   if (!invoice) {
     throw new NotFoundError("Invoice not found")
@@ -682,6 +684,7 @@ router.get("/:id/events", validateParams(invoiceIdParamSchema), asyncHandler(asy
       { projection: { _id: 0, event_type: 1, ledger: 1, ledger_closed_at: 1, transaction_hash: 1 } },
     )
     .sort({ ledger: 1, event_id: 1 })
+    .limit(MAX_EVENTS_PER_INVOICE)
     .toArray()
 
   res.json({
@@ -787,7 +790,7 @@ router.post("/", requireMerchantApiKey, validateBody(createInvoiceSchema), async
   const complianceDb = await connectMongo()
   const latestAudit = await getComplianceAuditCollection(complianceDb).findOne(
     { address: body.merchant_address },
-    { sort: { ledger: -1, _id: -1 } },
+    { sort: { ledger: -1, _id: -1 }, projection: { _id: 0, event_type: 1 } },
   )
   if (latestAudit && latestAudit.event_type === "address_blocked") {
     throw new ForbiddenError("Merchant address has been blocked by compliance")
@@ -805,7 +808,7 @@ router.post("/", requireMerchantApiKey, validateBody(createInvoiceSchema), async
   const collection = getInvoicesCollection(db)
 
   // Check for duplicate invoice ID to prevent conflicts (#877)
-  const existing = await collection.findOne({ invoice_id: result.invoice_id })
+  const existing = await collection.findOne({ invoice_id: result.invoice_id }, { projection: { _id: 1 } })
   if (existing) {
     throw Object.assign(
       new Error(`Invoice ID ${result.invoice_id} already exists; please retry to generate a new ID`),
